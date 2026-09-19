@@ -35,6 +35,10 @@ router = APIRouter(prefix="/api/ontology", tags=["ontology"])
 _MAX_FETCH_BYTES = 20 * 1024 * 1024  # 20 MB
 _MAX_ANALYSIS_NODES = 5_000   # cap for health/suggest/shacl node scans to avoid OOM
 _MAX_ENTITIES_PER_SIDE = 500  # per-ontology cap for the O(n²) pairwise suggestion loop
+_GRAPH_TOO_LARGE_DETAIL = (
+    "Ontology editor graph exceeds the maximum size "
+    f"({_MAX_ANALYSIS_NODES} nodes or edges)."
+)
 
 
 class GraphTruncationError(Exception):
@@ -72,6 +76,20 @@ _ONTOLOGY_TYPES = frozenset({
 }) | _SCHEME_TYPES
 
 _SEARCHABLE_TYPES = _CLASS_TYPES | _PROPERTY_TYPES | _INDIVIDUAL_TYPES | _CONCEPT_TYPES | _SCHEME_TYPES
+_SCHEMA_NODE_TYPES = _CLASS_TYPES | _PROPERTY_TYPES | _CONCEPT_TYPES | _ONTOLOGY_TYPES
+_STRUCTURE_EDGE_TYPES = frozenset({
+    "rdf:type",
+    "rdfs:subClassOf",
+    "rdfs:domain",
+    "rdfs:range",
+    "owl:disjointWith",
+    "owl:equivalentClass",
+    "owl:equivalentProperty",
+    "owl:inverseOf",
+    "skos:broader",
+    "skos:narrower",
+    "skos:related",
+})
 
 _URI_PREFIX_MAP = {
     "http://www.w3.org/2002/07/owl#": "owl:",
@@ -226,6 +244,7 @@ class EntityDetailResponse(BaseModel):
     entity_type: str
     definition: Optional[str] = None
     source_ontology: Optional[str] = None
+    owning_ontology: Optional[str] = None
     superclasses: List[str] = Field(default_factory=list)
     subclasses: List[str] = Field(default_factory=list)
     domain: List[str] = Field(default_factory=list)
@@ -794,6 +813,55 @@ def _node_belongs_to_ontology(
     # until it is registered or carries an explicit owner.
     local_name = nid[len(stem) + 1 :]
     return "#" not in local_name and "/" not in local_name
+
+
+def _resolve_owning_ontology(
+    node: Dict[str, Any],
+    known_ontology_uris: set[str],
+) -> Optional[str]:
+    """Return the one known ontology that owns this node, or None if none does.
+
+    The most specific (longest) match wins, so a nested vocabulary claims its
+    own terms instead of the parent absorbing them.
+
+    Kept agreeing with _node_belongs_to_ontology by construction — the same
+    three rules in the same order — but in one pass over the candidates rather
+    than one pass per candidate, each of which rescanned the whole set to find
+    the longest namespace. That made resolution quadratic in the number of
+    registered ontologies.
+    """
+    nid = str(node.get("id", ""))
+    if not nid:
+        return None
+
+    # An ontology node owns itself, ahead of any scheme_uri it may carry.
+    if nid in known_ontology_uris:
+        return nid
+
+    # An explicit owner is authoritative even when it is not registered:
+    # naming a different ontology by namespace guess would be worse than
+    # reporting the one the node itself points at.
+    explicit_owner = _node_source_ontology(node)
+    if explicit_owner:
+        return explicit_owner
+
+    longest_namespace: Optional[str] = None
+    for candidate in known_ontology_uris:
+        stem = candidate.rstrip("#/")
+        if not nid.startswith((stem + "#", stem + "/")):
+            continue
+        if longest_namespace is None or len(candidate) > len(longest_namespace):
+            longest_namespace = candidate
+    if longest_namespace is None:
+        return None
+
+    # Prefix ownership only extends to names minted directly in the namespace.
+    # A further delimiter marks a nested vocabulary, which stays unowned until
+    # it is registered or carries an explicit owner.
+    local_name = nid[len(longest_namespace.rstrip("#/")) + 1 :]
+    if "#" in local_name or "/" in local_name:
+        return None
+    return longest_namespace
 
 
 def _is_ontology_entity(node: Dict[str, Any]) -> bool:
@@ -1821,6 +1889,64 @@ async def search_entities(
     return results
 
 
+def _known_ontology_uris(
+    session: GraphSession, registry: Dict[str, OntologyEntry]
+) -> set[str]:
+    known = set(registry)
+    for node_type in _ONTOLOGY_TYPES:
+        for node in session.iter_nodes(node_type=node_type):
+            node_id = str(node.get("id", ""))
+            if node_id:
+                known.add(node_id)
+    return known
+
+
+def _collect_core_nodes(
+    session: GraphSession, uri: str, known_ontology_uris: set[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Stream schema nodes, keeping only the ones this ontology owns.
+
+    Filtering as each node arrives makes _MAX_ANALYSIS_NODES bound the work and
+    not merely the response: foreign nodes are discarded instead of materialized,
+    and the scan stops once the owned ones pass the cap. The ownership filter has
+    to stay ahead of that check — thousands of *other* ontologies' nodes must
+    never make this one too large to open. Requesting pages instead would bound
+    nothing: paginate_nodes normalizes the whole matching set on every call.
+    """
+    core_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    for node_type in _SCHEMA_NODE_TYPES:
+        for node in session.iter_nodes(node_type=node_type):
+            node_id = str(node.get("id", ""))
+            if not node_id or not _node_belongs_to_ontology(
+                node, uri, known_ontology_uris
+            ):
+                continue
+            core_nodes_by_id[node_id] = node
+            if len(core_nodes_by_id) > _MAX_ANALYSIS_NODES:
+                raise GraphTruncationError(_GRAPH_TOO_LARGE_DETAIL)
+    return core_nodes_by_id
+
+
+def _select_structure_edges(
+    session: GraphSession, core_node_ids: set[str]
+) -> List[Dict[str, Any]]:
+    """Stream structural edges, keeping only those leaving a core node.
+
+    The requested ontology may reference outward (e.g. rdfs:range to an external
+    vocabulary), but an unrelated ontology's property pointing at a core class
+    must not leak inward.
+    """
+    selected_edges: List[Dict[str, Any]] = []
+    for edge_type in _STRUCTURE_EDGE_TYPES:
+        for edge in session.iter_edges(edge_type=edge_type):
+            if str(edge.get("source", "")) not in core_node_ids:
+                continue
+            selected_edges.append(edge)
+            if len(selected_edges) > _MAX_ANALYSIS_NODES:
+                raise GraphTruncationError(_GRAPH_TOO_LARGE_DETAIL)
+    return selected_edges
+
+
 @router.get("/graph", response_model=OntologyGraphResponse)
 async def get_ontology_graph(
     request: Request,
@@ -1828,88 +1954,39 @@ async def get_ontology_graph(
     session: GraphSession = Depends(get_session),
 ):
     """Return the editable schema subgraph for one registered ontology."""
-    registry = _get_registry(request)
-    ontology_nodes: List[Dict[str, Any]] = []
-    for node_type in _ONTOLOGY_TYPES:
-        nodes, _ = await asyncio.to_thread(
-            session.get_nodes, node_type=node_type, skip=0, limit=2**63 - 1
-        )
-        ontology_nodes.extend(nodes)
-    known_ontology_uris = set(registry) | {
-        str(node.get("id", "")) for node in ontology_nodes if node.get("id")
-    }
+    known_ontology_uris = await asyncio.to_thread(
+        _known_ontology_uris, session, _get_registry(request)
+    )
     if uri not in known_ontology_uris:
         raise HTTPException(status_code=404, detail="Ontology not found in registry.")
 
-    schema_types = _CLASS_TYPES | _PROPERTY_TYPES | _CONCEPT_TYPES | _ONTOLOGY_TYPES
-    candidates_by_id: Dict[str, Dict[str, Any]] = {}
-    for node_type in schema_types:
-        nodes, _ = await asyncio.to_thread(
-            session.get_nodes, node_type=node_type, skip=0, limit=2**63 - 1
+    try:
+        core_nodes_by_id = await asyncio.to_thread(
+            _collect_core_nodes, session, uri, known_ontology_uris
         )
-        candidates_by_id.update(
-            (str(node.get("id", "")), node) for node in nodes if node.get("id")
+        if not core_nodes_by_id:
+            raise HTTPException(status_code=404, detail="Ontology graph not found.")
+        core_node_ids = set(core_nodes_by_id)
+        selected_edges = await asyncio.to_thread(
+            _select_structure_edges, session, core_node_ids
         )
+    except GraphTruncationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
-    core_node_ids = {
-        str(node.get("id", ""))
-        for node in candidates_by_id.values()
-        if _node_belongs_to_ontology(node, uri, known_ontology_uris)
-    }
-    if not core_node_ids:
-        raise HTTPException(status_code=404, detail="Ontology graph not found.")
+    # Invariant: the helpers raise the moment their accumulation passes
+    # _MAX_ANALYSIS_NODES, so core_nodes_by_id and selected_edges are both
+    # within the cap here; a post-filter re-check would be unreachable.
+    external_node_ids = {
+        node_id
+        for edge in selected_edges
+        for node_id in (str(edge.get("source", "")), str(edge.get("target", "")))
+    } - core_node_ids
+    external_nodes = await asyncio.gather(
+        *(asyncio.to_thread(session.get_node, node_id) for node_id in external_node_ids)
+    )
 
-    structure_edge_types = {
-        "rdf:type",
-        "rdfs:subClassOf",
-        "rdfs:domain",
-        "rdfs:range",
-        "owl:disjointWith",
-        "owl:equivalentClass",
-        "owl:equivalentProperty",
-        "owl:inverseOf",
-        "skos:broader",
-        "skos:narrower",
-        "skos:related",
-    }
-    selected_edges: List[Dict[str, Any]] = []
-    for edge_type in structure_edge_types:
-        edges, _ = await asyncio.to_thread(
-            session.get_edges,
-            edge_type=edge_type,
-            skip=0,
-            limit=2**63 - 1,
-        )
-        # Keep only edges whose source is a core node: the requested ontology
-        # may reference outward (e.g. rdfs:range to an external vocabulary),
-        # but an unrelated ontology's property pointing at a core class must
-        # not leak inward.
-        selected_edges.extend(
-            edge for edge in edges
-            if str(edge.get("source", "")) in core_node_ids
-        )
-    if (
-        len(core_node_ids) > _MAX_ANALYSIS_NODES
-        or len(selected_edges) > _MAX_ANALYSIS_NODES
-    ):
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "Ontology editor graph exceeds the maximum size "
-                f"({_MAX_ANALYSIS_NODES} nodes or edges)."
-            ),
-        )
-
-    selected_node_ids = set(core_node_ids)
-    for edge in selected_edges:
-        selected_node_ids.add(str(edge.get("source", "")))
-        selected_node_ids.add(str(edge.get("target", "")))
-
-    selected_nodes = [candidates_by_id[node_id] for node_id in core_node_ids]
-    for node_id in selected_node_ids - core_node_ids:
-        external = await asyncio.to_thread(session.get_node, node_id)
-        if external is not None:
-            selected_nodes.append(external)
+    selected_nodes = list(core_nodes_by_id.values())
+    selected_nodes.extend(node for node in external_nodes if node is not None)
     selected_nodes.sort(key=lambda node: str(node.get("id", "")))
     selected_edges.sort(
         key=lambda edge: (
@@ -1925,6 +2002,7 @@ async def get_ontology_graph(
 @router.get("/entity/{entity_uri:path}", response_model=EntityDetailResponse)
 async def get_entity_detail(
     entity_uri: str,
+    request: Request,
     session: GraphSession = Depends(get_session),
 ):
     node = await asyncio.to_thread(session.get_node, entity_uri)
@@ -1946,12 +2024,21 @@ async def get_entity_detail(
 
     all_nodes, _ = await asyncio.to_thread(session.get_nodes, skip=0, limit=999_999)
     instance_count = sum(1 for n in all_nodes if n.get("type") == entity_uri)
+    # Ownership must use the same candidate set as /graph, so it goes through the
+    # same helper rather than being derived from all_nodes above: that scan is
+    # capped at 999,999, and on a larger graph a truncated set would silently
+    # drop ontologies and make the two endpoints disagree about who owns a node.
+    # The helper iterates only the ontology node types, so it is not a full scan.
+    known_ontology_uris = await asyncio.to_thread(
+        _known_ontology_uris, session, _get_registry(request)
+    )
 
     return EntityDetailResponse(
         uri=entity_uri, label=label,
         type=ntype, entity_type=_classify_node_type(ntype),
         definition=definition,
         source_ontology=props.get("scheme_uri"),
+        owning_ontology=_resolve_owning_ontology(node, known_ontology_uris),
         superclasses=superclasses, subclasses=subclasses,
         domain=domain, range=range_,
         instance_count=instance_count, properties=props,
